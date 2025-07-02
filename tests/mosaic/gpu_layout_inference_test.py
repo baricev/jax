@@ -30,6 +30,8 @@ from jax._src.lib.mlir.dialects import func
 from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 import jax.experimental.mosaic.gpu as mgpu
+from jax.experimental.mosaic.gpu import equations
+from jax.experimental.mosaic.gpu import layout_inference2
 from jax.experimental.mosaic.gpu import layouts
 
 config.parse_flags_with_absl()
@@ -91,18 +93,13 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     self.assertSequenceEqual(op.attributes["out_layouts"], out_layouts)
 
   def test_infer_strided_layout_default(self):
-    self.skip_if_equations()
-    shape = (16, 8)
-    elt_type = ir.BF16Type.get()
-    add = None
-
-    def body(a, b):
-      nonlocal add
-      add = arith.AddFOp(a, b)
+    shape = (128,)
+    bf16 = ir.BF16Type.get()
 
     with ir.InsertionPoint(self.module.body):
-      ty = ir.VectorType.get(shape, elt_type)
-      func.FuncOp.from_py_func(ty, ty)(body)
+      ty = ir.VectorType.get(shape, bf16)
+      attrs = [ir.FloatAttr.get(bf16, float(i)) for i in range(shape[0])]
+      cst = arith.ConstantOp(ty, ir.DenseElementsAttr.get(attrs, ty))
 
     # Not setting any layouts on the module should default in ops having a
     # strided fragmented layout.
@@ -112,8 +109,8 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
         mgpu.WGStridedFragLayout.from_shaped_type(ty)
     )
 
-    self.checkInLayouts(add, [layout, layout])
-    self.checkOutLayouts(add, [layout])
+    self.checkInLayouts(cst, [])
+    self.checkOutLayouts(cst, [layout])
 
   def test_infer_strided_layout_from_shape_cast(self):
     self.skip_if_equations()
@@ -166,7 +163,6 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     self.checkOutLayouts(splat, [layout])
 
   def test_infer_layout_from_consumer_for_non_splat_constant(self):
-    self.skip_if_equations()
     shape = (16, 8)
     elt_type = ir.BF16Type.get()
     layout = layouts.to_layout_attr(
@@ -631,8 +627,72 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     self.checkOutLayouts(optimization_barrier, [splat_layout])
 
 
+V = equations.Variable
+H = layout_inference2.Hint
+E = equations.Equation
+C = equations.ConstantExpression
+
+
 class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=InferenceImplementation.EQUATIONS):
   ...
+
+  def test_hint_extraction_for_op_works_correctly(self):
+    shape = (64,)
+    bf16 = ir.BF16Type.get()
+    layout = mgpu.WGMMA_ROW_LAYOUT
+
+    with ir.InsertionPoint(self.module.body):
+      ty = ir.VectorType.get(shape, bf16)
+      attrs = [ir.FloatAttr.get(bf16, i) for i in range(shape[0])]
+      cst = arith.ConstantOp(ty, ir.DenseElementsAttr.get(attrs, type=ty))
+      lc = layout_cast(cst, layouts.to_layout_attr(layout)).owner.opview
+
+    equation_system, hints = layout_inference2.equation_system_and_hints_for_op(
+        lc, layout_inference2._layout_cast_equation_system
+    )
+
+    in_variable, out_variable = layout_inference2.op_variables(lc)
+    [cst_out_variable] = layout_inference2.op_variables(cst)
+
+    assignments = {v: C(layout) for v in [in_variable, out_variable]}
+
+    self.assertEqual(
+        equation_system, equations.EquationSystem(assignments=assignments)
+    )
+    self.assertEqual(hints, [H(in_variable, cst_out_variable)])
+
+  def test_unambiguous_hints_are_used_to_assign_variables_correctly(self):
+    v0 = V(0)
+    assignments = layout_inference2.find_assignments_for(
+        {v0},
+        equations.EquationSystem(),
+        # Voluntarily use conflicting hints to check that we use the first one.
+        [H(v0, C(mgpu.WGMMA_ROW_LAYOUT)), H(v0, C(mgpu.WGMMA_COL_LAYOUT))],
+    )
+    self.assertEqual(assignments, {v0: C(mgpu.WGMMA_ROW_LAYOUT)})
+
+  def test_cannot_find_assignments_for_unsatisfiable_equation_system(self):
+    shape = (64,)
+    bf16 = ir.BF16Type.get()
+
+    with ir.InsertionPoint(self.module.body):
+      ty = ir.VectorType.get(shape, bf16)
+      attrs = [ir.FloatAttr.get(bf16, i) for i in range(shape[0])]
+      cst = arith.ConstantOp(ty, ir.DenseElementsAttr.get(attrs, type=ty))
+
+    [variable] = layout_inference2.op_variables(cst)
+    assignments = layout_inference2.find_assignments_for(
+        {variable},
+        equations.EquationSystem(
+            equations=[
+                E(variable, C(mgpu.WGMMA_ROW_LAYOUT)),
+                E(variable, C(mgpu.WGMMA_COL_LAYOUT)),
+            ]
+        ),
+        hints={},
+    )
+    self.assertIsInstance(assignments, equations.Unsatisfiable)
+
 
 if __name__ == "__main__":
   parameterized.absltest.main(testLoader=jtu.JaxTestLoader())
